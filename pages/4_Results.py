@@ -4,8 +4,10 @@ import streamlit as st
 import nfl_model as nm
 import props as pr
 import tracker as tk
+import ui
 
-st.title("Results")
+ui.setup_page("Results", "📋")
+st.title("📋 Results")
 
 if tk.gist_ready():
     st.success("Picks are saved to your private GitHub Gist.")
@@ -75,32 +77,37 @@ if picks.empty:
     st.stop()
 
 # ---------- Summary ----------
-settled = picks[picks["result"].isin(["WIN", "LOSE", "PUSH"])]
-open_n = int((picks["result"].isna() | (picks["result"] == "")).sum())
-a, b, c, d = st.columns(4)
-a.metric("Picks", len(picks))
-a.caption(f"{open_n} open")
-staked = settled["stake"].sum()
-profit = settled["profit"].sum()
-b.metric("Profit (£)", f"{profit:+.2f}")
-c.metric("ROI", f"{profit / staked:+.1%}" if staked else "n/a")
-clv = picks["clv"].dropna()
-d.metric("Avg CLV", f"{clv.mean():+.1%}" if len(clv) else "n/a")
-d.caption(f"{len(clv)} with closing price")
+def show(df):
+    """Headline numbers + the picks table for a set of picks."""
+    settled = df[df["result"].isin(["WIN", "LOSE", "PUSH"])]
+    open_n = int((df["result"].isna() | (df["result"] == "")).sum())
+    staked, profit = settled["stake"].sum(), settled["profit"].sum()
+    clv = df["clv"].dropna()
+    a, b, c, d = st.columns(4)
+    a.metric("Picks", len(df))
+    a.caption(f"{open_n} open")
+    b.metric("Profit (£)", f"{profit:+.2f}")
+    c.metric("ROI", f"{profit / staked:+.1%}" if staked else "n/a")
+    d.metric("Avg CLV", f"{clv.mean():+.1%}" if len(clv) else "n/a")
+    d.caption(f"{len(clv)} with closing price")
+    cols = ["logged_at", "week", "selection", "game", "book", "price", "close_price", "clv",
+            "model", "stake", "result", "profit"]
+    st.dataframe(df.sort_values("logged_at", ascending=False)[cols], hide_index=True)
+
 
 st.caption("CLV compares the price you took with the latest price before kickoff. "
            "Consistently positive CLV is the best early sign of a real edge, well before "
            "win/loss results settle down.")
-
-summ = tk.summarise(picks)
-if not summ.empty:
-    st.subheader("By market")
-    st.dataframe(summ.round(3))
-
-# ---------- All picks ----------
-st.subheader("All picks")
-show = picks.sort_values("logged_at", ascending=False)[
-    ["logged_at", "week", "selection", "game", "book", "price", "close_price", "clv",
-     "model", "stake", "result", "profit"]]
-st.dataframe(show, hide_index=True)
+markets = [m for m in ["Moneyline", "Spread", "Total"] + [v[0] for v in pr.MARKETS.values()]
+           if m in set(picks["market"])]
+tabs = st.tabs(["📊 All"] + markets)
+with tabs[0]:
+    show(picks)
+    summ = tk.summarise(picks)
+    if not summ.empty:
+        st.markdown("**By market**")
+        st.dataframe(summ.round(3))
+for tab, m in zip(tabs[1:], markets):
+    with tab:
+        show(picks[picks["market"] == m])
 st.download_button("Download CSV", picks.to_csv(index=False), "nfl_picks.csv", "text/csv")

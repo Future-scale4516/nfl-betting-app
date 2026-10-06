@@ -59,14 +59,6 @@ MARKETS = {
 }
 API_TO_KEY = {v[1]: k for k, v in MARKETS.items()}
 
-# Stricter bands than game markets: (green edge, amber edge, max plausible model %)
-PROP_BANDS = {
-    "anytime_td": (0.05, 0.025, 0.80), "receptions": (0.06, 0.03, 0.85),
-    "rec_yards": (0.07, 0.035, 0.80), "rush_yards": (0.07, 0.035, 0.80),
-    "pass_yards": (0.07, 0.035, 0.80), "pass_tds": (0.06, 0.03, 0.85),
-    "rush_rec_yards": (0.07, 0.035, 0.80),
-}
-
 PROJ_STATS = ["receptions", "receiving_yards", "rushing_yards", "passing_yards",
               "passing_tds", "rush_rec_yards", "xtd", "td", "targets", "carries",
               "attempts", "touches"]
@@ -448,20 +440,37 @@ def props_to_rows(event, game_id):
     return pd.DataFrame(rows)
 
 
-def prop_light(key, prob, edge):
-    green, amber, ceiling = PROP_BANDS[key]
-    if prob > ceiling:
-        return "🔴"
-    if edge >= green:
-        return "🟢"
-    if edge >= amber:
-        return "🟡"
-    return "🔴"
+STD_LINES = {
+    "receptions": [2.5, 3.5, 4.5, 5.5, 6.5],
+    "rec_yards": [29.5, 39.5, 49.5, 59.5, 69.5, 79.5],
+    "rush_yards": [39.5, 49.5, 59.5, 69.5, 79.5],
+    "pass_yards": [199.5, 224.5, 249.5, 274.5, 299.5],
+    "pass_tds": [0.5, 1.5, 2.5],
+    "rush_rec_yards": [49.5, 59.5, 69.5, 79.5, 89.5],
+}
+
+
+def most_likely(active, key, line=None):
+    """Players ranked by model probability for a market (no odds needed).
+    Anytime TD: P(1+ TD). Others: P(over `line`)."""
+    usage_col, thr = MARKETS[key][3], MARKETS[key][4]
+    v = active[active[f"mu_{usage_col}"] >= thr].copy()
+    if key == "anytime_td":
+        v["prob"] = v["td_prob"]
+        v["proj"] = v["lam_td"]
+    else:
+        v["proj"] = [market_mu(r, key) for _, r in v.iterrows()]
+        v["prob"] = [over_under(m, DISPERSION[key], line, normal=key in NORMAL_MARKETS)[0]
+                     for m in v["proj"]]
+    return v.sort_values("prob", ascending=False)
 
 
 def build_prop_bets(proj, odds, trust=None):
     """Price every listed prop against the model. Only the most common line
-    per player/market is used, and the best price across bookmakers."""
+    per player/market is used, and the best price across bookmakers. Fair %
+    is de-vigged where bookmakers list both sides (over/under); one-sided
+    markets (anytime TD) use the best price's implied probability instead.
+    Model % = fair + trust x (raw model - fair)."""
     trust = PROP_TRUST if trust is None else trust
     if odds.empty or proj.empty:
         return pd.DataFrame()
@@ -471,24 +480,33 @@ def build_prop_bets(proj, odds, trust=None):
         cand = proj[(proj["game_id"] == gid) & (proj["player_norm"] == pn)]
         if cand.empty:
             continue
-        pr = cand.iloc[0]
+        row = cand.iloc[0]
         label = MARKETS[key][0]
 
-        def add(side, line, price, book, p_win, p_push=0.0):
-            implied = 1 / price
-            used = implied + trust * (p_win / (1 - p_push) - implied)
-            edge = used - implied
+        def add(side, line, best, p_win, fair, two_sided, p_push=0.0):
+            price, book = float(best["price"]), best["book"]
+            p_raw = p_win / (1 - p_push)
+            model = fair + trust * (p_raw - fair)
+            edge = model - fair
+            if key == "anytime_td":
+                why = f"Expected TDs {row['lam_td']:.2f}"
+            else:
+                why = f"Projection {market_mu(row, key):.1f} vs line {line:g}"
+            why += f" · {row['n_hist']} games of history · raw model {p_raw:.0%}"
+            if not two_sided:
+                why += " · one-sided market, so Fair % is the price-implied probability"
             out.append({
-                "game_id": pr["game_id"], "home": pr["home"], "away": pr["away"],
-                "game": f"{pr['away']} @ {pr['home']}",
+                "game_id": row["game_id"], "home": row["home"], "away": row["away"],
+                "game": f"{row['away']} @ {row['home']}",
                 "market": label, "market_key": key, "side": side, "line": line,
-                "player_id": pr["player_id"], "player": pr["player"],
-                "selection": f"{pr['player']} {label} " + (
-                    "Yes" if side == "yes" else f"{side.title()} {line:g}"),
-                "price": price, "book": book, "model_raw": p_win / (1 - p_push),
-                "model": used, "implied": implied, "edge": edge,
-                "ev": used * price - 1,
-                "light": prop_light(key, used, edge),
+                "player_id": row["player_id"], "player": row["player"],
+                "pos": row["pos"], "team": row["team"], "opp": row["opp"],
+                "inj_note": row.get("inj_note", ""),
+                "selection": f"{row['player']} " + (
+                    "Anytime TD" if side == "yes" else f"{side.title()} {line:g} {label}"),
+                "price": price, "book": book, "model_raw": p_raw, "model": model,
+                "fair": fair, "implied": 1 / price, "edge": edge, "ev": model * price - 1,
+                "reason": why, "light": nm.classify_pick(edge * 100, model * 100, label),
             })
 
         if key == "anytime_td":
@@ -496,21 +514,25 @@ def build_prop_bets(proj, odds, trust=None):
             if yes.empty:
                 continue
             best = yes.loc[yes["price"].idxmax()]
-            add("yes", None, float(best["price"]), best["book"], pr["td_prob"])
+            add("yes", None, best, row["td_prob"], 1 / float(best["price"]), False)
             continue
 
-        mu = market_mu(pr, key)
-        r = DISPERSION[key]
         ov = g[g["name"] == "Over"]
         if ov.empty:
             continue
         line = float(ov["point"].mode().iloc[0])
-        p_over, p_under, p_push = over_under(mu, r, line, normal=key in NORMAL_MARKETS)
-        o = ov[ov["point"] == line]
-        b = o.loc[o["price"].idxmax()]
-        add("over", line, float(b["price"]), b["book"], p_over, p_push)
-        un = g[(g["name"] == "Under") & (g["point"] == line)]
-        if not un.empty:
-            b = un.loc[un["price"].idxmax()]
-            add("under", line, float(b["price"]), b["book"], p_under, p_push)
+        ov_l = ov[ov["point"] == line]
+        un_l = g[(g["name"] == "Under") & (g["point"] == line)]
+        fair_o = nm._fair_pair(ov_l, un_l)
+        mu = market_mu(row, key)
+        p_over, p_under, p_push = over_under(mu, DISPERSION[key], line,
+                                             normal=key in NORMAL_MARKETS)
+        b_o = ov_l.loc[ov_l["price"].idxmax()]
+        add("over", line, b_o, p_over, fair_o if fair_o is not None else 1 / float(b_o["price"]),
+            fair_o is not None, p_push)
+        if not un_l.empty:
+            b_u = un_l.loc[un_l["price"].idxmax()]
+            add("under", line, b_u, p_under,
+                (1 - fair_o) if fair_o is not None else 1 / float(b_u["price"]),
+                fair_o is not None, p_push)
     return pd.DataFrame(out)

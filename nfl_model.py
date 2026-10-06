@@ -32,14 +32,34 @@ PARAMS = {
     "w_margin": 0.10,       # weight on model vs market line for margins (1 = pure model)
     "w_total": 0.10,        # same, for totals
     "qb_adj": 2.3,          # points removed from a team missing its starting QB
+    "margin_sd_raw": 13.1,  # SD of real margins around the raw model (backtest)
+    "total_sd_raw": 13.2,   # same, for totals
 }
 
-# Traffic lights per market: (green edge, amber edge, max plausible model %)
-BANDS = {
-    "Moneyline": (0.04, 0.02, 0.90),
-    "Spread": (0.03, 0.015, 0.70),
-    "Total": (0.03, 0.015, 0.70),
+# Traffic lights, same logic as the MLB app. Edge is in percentage points:
+# grey under 2 = no signal, green 2-8 = believable, amber 8-15 = caution, red
+# 15+ = probably a bad input or stale price. A model probability above the
+# market's ceiling is red on its own, whatever the edge.
+EDGE_BANDS = {"default": (2, 8, 15)}
+PROB_CEILING = {
+    "Moneyline": 90, "Spread": 70, "Total": 70, "Anytime TD": 80, "Receptions": 85,
+    "Receiving yards": 80, "Rushing yards": 80, "Passing yards": 80,
+    "Passing TDs": 85, "Rush + rec yards": 80,
 }
+
+
+def classify_pick(edge_pts, model_pct, market=None):
+    lo, mid, hi = EDGE_BANDS.get(market, EDGE_BANDS["default"])
+    if model_pct is not None and model_pct > PROB_CEILING.get(market, 90):
+        return "🔴"
+    if edge_pts >= hi:
+        return "🔴"
+    if edge_pts >= mid:
+        return "🟡"
+    if edge_pts >= lo:
+        return "🟢"
+    return "⚪"
+
 
 TEAM_ABBR = {
     "Arizona Cardinals": "ARI", "Atlanta Falcons": "ATL", "Baltimore Ravens": "BAL",
@@ -294,9 +314,22 @@ def _best(df):
     return float(r["price"]), r["book"]
 
 
+def _fair_pair(a, b):
+    """De-vigged probability of side `a`, from bookmakers listing both sides
+    (median across books). None if no bookmaker lists both."""
+    if a is None or b is None or a.empty or b.empty:
+        return None
+    m = a[["book", "price"]].merge(b[["book", "price"]], on="book", suffixes=("_a", "_b"))
+    if m.empty:
+        return None
+    ia, ib = 1 / m["price_a"], 1 / m["price_b"]
+    return float((ia / (ia + ib)).median())
+
+
 def best_prices(odds, home, away):
-    """Best price + bookmaker per side. Spreads/totals use the most common
-    line only, so prices from different lines are never mixed."""
+    """Best price + bookmaker per side, plus the de-vigged fair probability.
+    Spreads/totals use the most common line only, so prices from different
+    lines are never mixed."""
     g = odds[(odds["home"] == home) & (odds["away"] == away)]
     out = {}
     if g.empty:
@@ -304,24 +337,27 @@ def best_prices(odds, home, away):
     hn, an = ABBR_TEAM[home], ABBR_TEAM[away]
 
     ml = g[g["market"] == "h2h"]
-    out["ml_home"] = _best(ml[ml["name"] == hn])
-    out["ml_away"] = _best(ml[ml["name"] == an])
+    ml_h, ml_a = ml[ml["name"] == hn], ml[ml["name"] == an]
+    out["ml_home"], out["ml_away"] = _best(ml_h), _best(ml_a)
+    out["fair_ml_home"] = _fair_pair(ml_h, ml_a)
 
     sp = g[g["market"] == "spreads"]
     sp_home = sp[sp["name"] == hn]
     if not sp_home.empty:
         line = float(sp_home["point"].mode().iloc[0])
-        out["spread_line"] = line
-        out["spread_home"] = _best(sp_home[sp_home["point"] == line])
-        out["spread_away"] = _best(sp[(sp["name"] == an) & (sp["point"] == -line)])
+        sh = sp_home[sp_home["point"] == line]
+        sa = sp[(sp["name"] == an) & (sp["point"] == -line)]
+        out.update(spread_line=line, spread_home=_best(sh), spread_away=_best(sa),
+                   fair_spread_home=_fair_pair(sh, sa))
 
     tot = g[g["market"] == "totals"]
     over = tot[tot["name"] == "Over"]
     if not over.empty:
         line = float(over["point"].mode().iloc[0])
-        out["total_line"] = line
-        out["over"] = _best(over[over["point"] == line])
-        out["under"] = _best(tot[(tot["name"] == "Under") & (tot["point"] == line)])
+        ov = over[over["point"] == line]
+        un = tot[(tot["name"] == "Under") & (tot["point"] == line)]
+        out.update(total_line=line, over=_best(ov), under=_best(un),
+                   fair_over=_fair_pair(ov, un))
     return out
 
 
@@ -336,18 +372,13 @@ def map_events_to_games(events, games):
     return out
 
 
-def traffic_light(market, prob, edge):
-    green, amber, ceiling = BANDS[market]
-    if prob > ceiling:
-        return "🔴"
-    if edge >= green:
-        return "🟢"
-    if edge >= amber:
-        return "🟡"
-    return "🔴"
-
-
 def build_bets(preds, odds, params=None):
+    """Price every moneyline / spread / total selection.
+
+    The model probability starts from the bookmakers' de-vigged fair
+    probability and moves w of the way toward the raw model (w comes from the
+    backtest and is small, because the model adds little beyond the market).
+    Edge = model - fair. EV uses the best available price."""
     p = params or PARAMS
     bets = []
     for _, r in preds.iterrows():
@@ -355,42 +386,53 @@ def build_bets(preds, odds, params=None):
         pr = best_prices(odds, h, a)
         if not pr:
             continue
-        mu, tot = r["model_margin"], r["model_total"]
-        cands = []  # (market, key, side, label, line, (price, book), prob)
+        raw_m, raw_t = r["raw_margin"], r["raw_total"]
+        reason = (f"Model line {fmt_spread(h, a, raw_m)}, total {raw_t:.1f} · "
+                  f"Market {fmt_spread(h, a, r['mkt_spread'])}, total {r['mkt_total']}")
+        cands = []  # (market, key, side, label, line, best, fair, raw_prob, w)
 
-        ph = r["home_win_prob"]
-        cands += [
-            ("Moneyline", "moneyline", "home", f"{h} to win", None, pr.get("ml_home"), ph),
-            ("Moneyline", "moneyline", "away", f"{a} to win", None, pr.get("ml_away"), 1 - ph),
-        ]
-        if pr.get("spread_home") and pr["spread_home"][0]:
+        fh = pr.get("fair_ml_home")
+        if fh is not None:
+            raw_h = 1 - norm_cdf(-raw_m / p["margin_sd_raw"])
+            w = p["w_margin"]
+            cands += [
+                ("Moneyline", "moneyline", "home", f"{h} to win", None, pr.get("ml_home"), fh, raw_h, w),
+                ("Moneyline", "moneyline", "away", f"{a} to win", None, pr.get("ml_away"), 1 - fh, 1 - raw_h, w),
+            ]
+        fs = pr.get("fair_spread_home")
+        if fs is not None:
             line = pr["spread_line"]  # home team's handicap, e.g. -3.5
-            p_cover = 1 - norm_cdf((-line - mu) / p["margin_sd"])
-            cands.append(("Spread", "spread", "home", f"{h} {line:+g}", line,
-                          pr["spread_home"], p_cover))
-            cands.append(("Spread", "spread", "away", f"{a} {-line:+g}", line,
-                          pr.get("spread_away"), 1 - p_cover))
-        if pr.get("over") and pr["over"][0]:
+            raw_c = 1 - norm_cdf((-line - raw_m) / p["margin_sd_raw"])
+            w = p["w_margin"]
+            cands += [
+                ("Spread", "spread", "home", f"{h} {line:+g}", line, pr.get("spread_home"), fs, raw_c, w),
+                ("Spread", "spread", "away", f"{a} {-line:+g}", line, pr.get("spread_away"), 1 - fs, 1 - raw_c, w),
+            ]
+        fo = pr.get("fair_over")
+        if fo is not None:
             line = pr["total_line"]
-            p_over = 1 - norm_cdf((line - tot) / p["total_sd"])
-            cands.append(("Total", "total", "over", f"Over {line:g}", line, pr["over"], p_over))
-            cands.append(("Total", "total", "under", f"Under {line:g}", line,
-                          pr.get("under"), 1 - p_over))
+            raw_o = 1 - norm_cdf((line - raw_t) / p["total_sd_raw"])
+            w = p["w_total"]
+            cands += [
+                ("Total", "total", "over", f"Over {line:g}", line, pr.get("over"), fo, raw_o, w),
+                ("Total", "total", "under", f"Under {line:g}", line, pr.get("under"), 1 - fo, 1 - raw_o, w),
+            ]
 
-        for market, key, side, label, line, pb, prob in cands:
+        for market, key, side, label, line, pb, fair, raw, w in cands:
             if not pb or pb[0] is None or pd.isna(pb[0]):
                 continue
             price, book = pb
-            implied = 1 / price
-            edge = prob - implied
+            model = fair + w * (raw - fair)
+            edge = model - fair
             bets.append({
-                "game_id": r["game_id"], "home": h, "away": a,
-                "game": f"{a} @ {h}", "gameday": r["gameday"], "gametime": r["gametime"],
+                "game_id": r["game_id"], "home": h, "away": a, "game": f"{a} @ {h}",
+                "gameday": r["gameday"], "gametime": r["gametime"],
                 "market": market, "market_key": key, "side": side,
                 "selection": label, "line": line, "player_id": "", "player": "",
-                "price": price, "book": book, "model": prob, "implied": implied,
-                "edge": edge, "ev": prob * price - 1,
-                "light": traffic_light(market, prob, edge),
+                "price": price, "book": book, "model": model, "fair": fair,
+                "raw_model": raw, "implied": 1 / price, "edge": edge,
+                "ev": model * price - 1, "reason": reason,
+                "light": classify_pick(edge * 100, model * 100, market),
             })
     return pd.DataFrame(bets)
 

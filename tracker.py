@@ -150,7 +150,11 @@ def settle_one(r, sched, stats):
     if key == "total":
         return _outcome(g["home_score"] + g["away_score"], line, side)
 
-    row = stats[(stats["player_id"] == r["player_id"]) & (stats["week"] == g["week"])]
+    # nflverse can publish final scores before player stats: stay pending until
+    # this game's stats exist, otherwise a late stat feed would look like a DNP.
+    if stats[stats["game_id"] == r["game_id"]].empty:
+        return None
+    row = stats[(stats["player_id"] == r["player_id"]) & (stats["game_id"] == r["game_id"])]
     if row.empty:
         return "VOID"  # did not play
     value = float(row.iloc[0][STAT_COL[key]])

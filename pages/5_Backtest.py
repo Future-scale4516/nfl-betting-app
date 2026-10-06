@@ -3,9 +3,11 @@ import pandas as pd
 import streamlit as st
 
 import nfl_model as nm
+import ui
 import props as pr
 
-st.title("Backtest")
+ui.setup_page("Backtest", "📉")
+st.title("📉 Backtest")
 st.caption("Replays past seasons week by week using only information that was available "
            "before each week, then compares the model with what actually happened.")
 
