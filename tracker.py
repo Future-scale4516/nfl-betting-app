@@ -5,6 +5,7 @@ restarts (a Gist, unlike a repo commit, does not trigger an app redeploy).
 If the Gist isn't configured, picks live in the browser session only and can
 be downloaded as CSV."""
 import io
+import json
 from datetime import datetime, timezone
 
 import numpy as np
@@ -20,7 +21,7 @@ COLUMNS = [
     "pick_id", "logged_at", "season", "week", "game_id", "game", "gameday", "gametime",
     "market", "market_key", "side", "line", "player_id", "player", "selection", "book",
     "price", "model", "implied", "stake", "close_price", "clv", "result", "profit",
-    "settled_at",
+    "settled_at", "legs",
 ]
 GIST_FILE = "picks.csv"
 
@@ -43,7 +44,7 @@ def _clean(df):
         if c not in df.columns:
             df[c] = np.nan
     df = df[COLUMNS].copy()
-    for c in ("player_id", "player", "result", "settled_at", "pick_id", "side"):
+    for c in ("player_id", "player", "result", "settled_at", "pick_id", "side", "legs"):
         df[c] = df[c].astype("object")
     return df
 
@@ -98,6 +99,55 @@ def log_pick(bet, stake, season, week):
         "player": bet.get("player", ""), "selection": bet["selection"],
         "book": bet.get("book"), "price": bet["price"], "model": bet["model"],
         "implied": bet["implied"], "stake": stake,
+    }
+    save_picks(pd.concat([df, pd.DataFrame([row])], ignore_index=True))
+    return True
+
+
+FOLD_KEY = "acca"
+
+
+def _num(x):
+    """JSON-safe number: NaN/None -> None."""
+    try:
+        return None if x is None or pd.isna(x) else float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def _leg(b):
+    """Normalise a bet row (Game Bets row or Suggested Bets leg) to a stored leg."""
+    return {
+        "game_id": str(b["game_id"]), "game": str(b["game"]),
+        "selection": str(b.get("selection", b.get("label", ""))),
+        "market_key": str(b["market_key"]), "side": str(b.get("side", "")),
+        "line": _num(b.get("line")), "player_id": str(b.get("player_id", "") or ""),
+        "player": str(b.get("player", "") or ""),
+        "price": _num(b.get("price", b.get("odds"))), "model": _num(b.get("model")),
+    }
+
+
+def log_fold(legs, stake, season, week):
+    """Log an accumulator as ONE pick carrying its legs. `legs` is a list of
+    dicts or a DataFrame. Returns False if the same fold is already logged."""
+    legs = [_leg(b) for b in (legs.to_dict("records") if hasattr(legs, "to_dict") else legs)]
+    if len(legs) < 2:
+        raise ValueError("A fold needs at least two legs.")
+    pid = "ACCA|" + "&".join(sorted(
+        f"{l['game_id']}|{l['market_key']}|{l['side']}|{l['line'] if l['line'] is not None else ''}"
+        f"|{l['player_id']}" for l in legs))
+    df = load_picks()
+    if pid in set(df["pick_id"].dropna()):
+        return False
+    odds = float(np.prod([l["price"] for l in legs]))
+    model = float(np.prod([l["model"] if l["model"] is not None else np.nan for l in legs]))
+    row = {
+        "pick_id": pid, "logged_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "season": season, "week": week, "game_id": "", "game": f"{len(legs)}-fold",
+        "market": "Accumulator", "market_key": FOLD_KEY, "side": "",
+        "selection": " + ".join(l["selection"] for l in legs),
+        "book": "", "price": odds, "model": model, "implied": 1 / odds, "stake": stake,
+        "legs": json.dumps(legs),
     }
     save_picks(pd.concat([df, pd.DataFrame([row])], ignore_index=True))
     return True
@@ -163,6 +213,30 @@ def settle_one(r, sched, stats):
     return _outcome(value, line, side)
 
 
+def fold_legs(r, sched, stats):
+    """[(leg dict, WIN/LOSE/PUSH/VOID/None)] for a logged fold."""
+    out = []
+    for leg in json.loads(r["legs"]):
+        out.append((leg, settle_one(pd.Series({**leg, "line": leg["line"] if leg["line"]
+                                               is not None else np.nan}), sched, stats)))
+    return out
+
+
+def settle_fold(r, sched, stats):
+    """(result, effective_odds) or (None, None) while still alive. One lost leg
+    kills the fold immediately; pushed/void legs count as 1.00 like a bookmaker."""
+    legs = fold_legs(r, sched, stats)
+    res = [s for _, s in legs]
+    if "LOSE" in res:
+        return "LOSE", 0.0
+    if any(s is None for s in res):
+        return None, None
+    won = [l["price"] for l, s in legs if s == "WIN"]
+    if not won:
+        return "PUSH", 1.0
+    return "WIN", float(np.prod(won))
+
+
 def settle_picks(df):
     """Fill in result/profit for every pick whose game has finished."""
     df = df.copy()
@@ -172,10 +246,13 @@ def settle_picks(df):
         sched = nm.get_schedule(int(season))
         stats = _player_stats(int(season))
         for i in open_idx[df.loc[open_idx, "season"] == season]:
-            res = settle_one(df.loc[i], sched, stats)
+            if df.at[i, "market_key"] == FOLD_KEY:
+                res, price = settle_fold(df.loc[i], sched, stats)
+            else:
+                res, price = settle_one(df.loc[i], sched, stats), df.at[i, "price"]
             if res is None:
                 continue
-            stake, price = df.at[i, "stake"], df.at[i, "price"]
+            stake = df.at[i, "stake"]
             df.at[i, "result"] = res
             df.at[i, "profit"] = stake * (price - 1) if res == "WIN" else (
                 -stake if res == "LOSE" else 0.0)
@@ -219,6 +296,8 @@ def update_closing(df, game_odds, prop_odds):
     df = df.copy()
     n = 0
     for i in df.index[df["result"].isna() | (df["result"] == "")]:
+        if df.at[i, "market_key"] == FOLD_KEY:  # no single closing price for a fold
+            continue
         p = _current_price(df.loc[i], game_odds, prop_odds)
         if p:
             df.at[i, "close_price"] = p

@@ -42,6 +42,14 @@ BIAS = {
     "pass_yards": 0.95, "pass_tds": 0.97, "rush_rec_yards": 0.99,
 }
 
+# Logistic recalibration of P(over) for the four volume markets (a * logit(p) + b).
+# Fitted on 2024-2025 standard lines; on the unseen 2026 weeks it cut log-loss
+# 0.4826 -> 0.4783 and fixed most of the under-confidence on likely overs. Fitted
+# on 2024 alone it also improved 2025. Not applied to passing yards (it hurt) or
+# passing TDs (no effect). A gap remains above 70% (model ~78% vs actual ~84%).
+CALIBRATION = {k: (1.11, 0.26) for k in
+               ("receptions", "rec_yards", "rush_yards", "rush_rec_yards")}
+
 # Model probability is pulled this far toward the bookmaker's price before an
 # edge is shown (1 = trust the model fully). Tune from Results/CLV data.
 PROP_TRUST = 0.5
@@ -184,6 +192,25 @@ def over_under(mu, r, line, normal=False):
         return 1 - p_le, p_le - p_push, p_push
     p_le = nb_cdf(math.floor(line), mu, r)
     return 1 - p_le, p_le, 0.0
+
+
+def calibrate_prob(p, key):
+    """Apply the market's logistic recalibration (identity if it has none)."""
+    if key not in CALIBRATION:
+        return p
+    a, b = CALIBRATION[key]
+    p = np.clip(p, 1e-6, 1 - 1e-6)
+    return 1 / (1 + np.exp(-(a * np.log(p / (1 - p)) + b)))
+
+
+def prop_over_under(mu, key, line):
+    """Calibrated (P(over), P(under), P(push)) for a prop market and line."""
+    p_over, p_under, p_push = over_under(mu, DISPERSION[key], line,
+                                         normal=key in NORMAL_MARKETS)
+    if key not in CALIBRATION:
+        return p_over, p_under, p_push
+    p_over = float(calibrate_prob(p_over, key))
+    return p_over, max(0.0, 1 - p_push - p_over), p_push
 
 
 def td_prob(lam):
@@ -460,7 +487,7 @@ def most_likely(active, key, line=None):
         v["proj"] = v["lam_td"]
     else:
         v["proj"] = [market_mu(r, key) for _, r in v.iterrows()]
-        v["prob"] = [over_under(m, DISPERSION[key], line, normal=key in NORMAL_MARKETS)[0]
+        v["prob"] = [prop_over_under(m, key, line)[0]
                      for m in v["proj"]]
     return v.sort_values("prob", ascending=False)
 
@@ -525,8 +552,7 @@ def build_prop_bets(proj, odds, trust=None):
         un_l = g[(g["name"] == "Under") & (g["point"] == line)]
         fair_o = nm._fair_pair(ov_l, un_l)
         mu = market_mu(row, key)
-        p_over, p_under, p_push = over_under(mu, DISPERSION[key], line,
-                                             normal=key in NORMAL_MARKETS)
+        p_over, p_under, p_push = prop_over_under(mu, key, line)
         b_o = ov_l.loc[ov_l["price"].idxmax()]
         add("over", line, b_o, p_over, fair_o if fair_o is not None else 1 / float(b_o["price"]),
             fair_o is not None, p_push)

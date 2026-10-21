@@ -3,6 +3,7 @@ import pandas as pd
 import streamlit as st
 
 import nfl_model as nm
+import tracker as tk
 import ui
 
 ui.setup_page("Game Bets", "🎯")
@@ -143,8 +144,14 @@ if isinstance(gdf, pd.DataFrame) and not gdf.empty \
                 st.warning("⚠️ Multiple legs from the same game (" + ", ".join(dupes) +
                            "). Those outcomes are correlated, so the chances above are "
                            "off and most bookmakers need a same-game multi instead.")
+            if len(sel) >= 2 and st.button("Log this fold", key="log_fold"):
+                try:
+                    ok = tk.log_fold(sel, stake, ui.SEASON, ctx.week)
+                    st.toast("Fold logged" if ok else "Already logged")
+                except Exception as e:
+                    st.error(f"Could not save fold: {e}")
             for i, (_, b) in enumerate(sel.iterrows()):
-                ui.bet_card(ctx, b, f"acca{i}")
+                ui.bet_card(ctx, b, f"acca{i}", loggable=False)
             st.caption("Chances assume the legs are independent (true across different "
                        "games). Every extra leg multiplies the bookmaker's margin along "
                        "with the odds, so a fold is high-variance even when each leg is "

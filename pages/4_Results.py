@@ -223,6 +223,16 @@ def show(df):
     cols = ["logged_at", "week", "selection", "game", "book", "price", "close_price", "clv",
             "model", "stake", "result", "profit"]
     st.dataframe(df.sort_values("logged_at", ascending=False)[cols], hide_index=True)
+    folds = df[df["market_key"] == tk.FOLD_KEY]
+    if not folds.empty:
+        st.markdown("**Fold legs**")
+        sched, stats = nm.get_schedule(nm.SEASON), tk._player_stats(nm.SEASON)
+        for _, f in folds.sort_values("logged_at", ascending=False).iterrows():
+            state = f["result"] if isinstance(f["result"], str) and f["result"] else "OPEN"
+            with st.expander(f"{f['game']} @ {f['price']:.2f} · £{f['stake']:.2f} · {state}"):
+                for leg, res in tk.fold_legs(f, sched, stats):
+                    st.write(f"{ui.STATUS_BADGE.get(res, '⏳ Pending')} {leg['selection']} "
+                             f"@ {leg['price']:.2f} ({leg['game']})")
 
 
 pmarkets = [m for m in ["Moneyline", "Spread", "Total"] + [v[0] for v in pr.MARKETS.values()]

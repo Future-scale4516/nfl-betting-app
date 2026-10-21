@@ -101,9 +101,7 @@ def prop_results(roll, season, week, params=None):
             continue
         mu = pr.stat_mu(q, key, p["gamma"])
         y = q[col].to_numpy(float)
-        normal = key in pr.NORMAL_MARKETS
         for line in pr.STD_LINES[key]:
-            prob = np.array([pr.over_under(m, pr.DISPERSION[key], line, normal=normal)[0]
-                             for m in mu])
+            prob = np.array([pr.prop_over_under(m, key, line)[0] for m in mu])
             add(q, label, f"Over {line:g}", prob, mu, y, y > line)
     return pd.concat(rows, ignore_index=True) if rows else None

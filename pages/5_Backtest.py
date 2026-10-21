@@ -103,7 +103,11 @@ if st.button("Run props backtest"):
     summ, cals, td, td_cal = props_backtest(season)
     st.subheader("Projection accuracy")
     st.dataframe(summ.round(2), hide_index=True)
-    st.caption("avg_projection should match avg_actual. Dispersion controls how wide the "
+    st.caption("These tables test the raw model. The live Player Props page also applies a "
+               "small recalibration (props.CALIBRATION) to receptions and rush/receiving "
+               "yards, fitted on 2024-25 and checked on 2026, which fixed most of the "
+               "under-confidence on likely overs. "
+               "avg_projection should match avg_actual. Dispersion controls how wide the "
                "outcome range is (for passing yards it is the SD as a fraction of the "
                "projection).")
 

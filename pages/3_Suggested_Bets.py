@@ -3,6 +3,7 @@ import streamlit as st
 
 import nfl_model as nm
 import props as pr
+import tracker as tk
 import ui
 
 ui.setup_page("Suggested Bets", "📋")
@@ -122,8 +123,14 @@ if results is not None and st.session_state.get("suggested_week") == ctx.week:
                     st.metric(f"Return on £{stake:.2f}", f"£{stake * combo['odds']:.2f}")
                     st.caption(f"Worth {combo['fair'] * combo['odds'] - 1:+.1%} if the "
                                "market's fair prices are right.")
+                    if st.button(f"Log this {label.lower()}", key=f"fold_{market}_{kind}"):
+                        try:
+                            ok = tk.log_fold(combo["legs"], stake, ui.SEASON, ctx.week)
+                            st.toast("Fold logged" if ok else "Already logged")
+                        except Exception as e:
+                            st.error(f"Could not save fold: {e}")
         st.divider()
         st.caption("Combined odds and stakes are starting points, not instructions: "
                    "confirm live prices at your book before staking. Suggestions are not "
-                   "saved between visits. To track a combo, log its legs on the Game Bets "
-                   "or Player Props pages.")
+                   "saved between visits. Use Log this double / treble to track a combo on "
+                   "the Results page.")
