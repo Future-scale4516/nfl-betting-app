@@ -458,11 +458,12 @@ def props_to_rows(event, game_id):
                 continue
             for oc in mk.get("outcomes", []):
                 rows.append({
-                    "event_id": event["id"], "game_id": game_id, "book": bk["title"],
+                    "event_id": event["id"], "game_id": game_id, "book": nm.book_label(bk),
                     "market_key": key,
                     "player_norm": norm_name(oc.get("description", "")),
                     "player_raw": oc.get("description", ""),
-                    "name": oc["name"], "point": oc.get("point"), "price": oc["price"],
+                    "name": oc["name"], "point": oc.get("point"),
+                    "price": nm.net_price(bk.get("key"), oc["price"]),
                 })
     return pd.DataFrame(rows)
 

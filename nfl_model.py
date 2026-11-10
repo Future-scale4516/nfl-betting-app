@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+from scipy.special import ndtr
 import nflreadpy as nfl
 
 try:  # keep nflreadpy from holding full play-by-play files in memory
@@ -87,6 +88,57 @@ def norm_cdf(x):
 
 def norm_cdf_arr(x):
     return 0.5 * (1 + np.vectorize(math.erf, otypes=[float])(np.asarray(x) / math.sqrt(2)))
+
+
+# Key numbers. Observed frequency of each final home margin vs what a normal
+# curve centred on the closing spread predicts (4,175 regular-season games,
+# 2010-2025, SD 13.1). A margin of exactly 3 happens ~2.7x as often as a smooth
+# curve says, 7 ~1.8x, 0 (ties) ~0.1x. (obs+10)/(expected+10) keeps noisy
+# bins from overreacting.
+KEY_MULT = {0: 0.12, 1: 0.82, 2: 0.82, 3: 2.65, 4: 0.95, 5: 0.78, 6: 1.29, 7: 1.77,
+            8: 0.89, 9: 0.37, 10: 1.18, 11: 0.53, 12: 0.85, 13: 0.64, 14: 1.42,
+            15: 0.9, 16: 1.1, 17: 1.18, 18: 0.9, 19: 0.85, 20: 0.93, 21: 1.25}
+_KS = np.arange(-70, 71)
+_KM = np.array([KEY_MULT.get(abs(int(k)), 1.0) for k in _KS])
+
+
+def outcome_probs(mu, sd, threshold, key_numbers=True, lo=-70, hi=70):
+    """P(X > threshold), P(X == threshold), P(X < threshold) for an integer
+    outcome X ~ discretised normal(mu, sd), optionally reweighted so that margins
+    of 3, 7 etc. get their real-world extra mass. Arrays in, arrays out. Use
+    key_numbers=True for game margins and False for totals (pass lo/hi)."""
+    mu = np.atleast_1d(np.asarray(mu, float))
+    thr = np.broadcast_to(np.atleast_1d(np.asarray(threshold, float)), mu.shape)
+    ks = _KS if key_numbers else np.arange(lo, hi + 1)
+    m = ndtr((ks[None, :] + .5 - mu[:, None]) / sd) - ndtr((ks[None, :] - .5 - mu[:, None]) / sd)
+    if key_numbers:
+        m = m * _KM[None, :]
+    m = m / m.sum(axis=1, keepdims=True)
+    gt = (ks[None, :] > thr[:, None]) * m
+    eq = (ks[None, :] == thr[:, None]) * m
+    return gt.sum(axis=1), eq.sum(axis=1), 1 - gt.sum(axis=1) - eq.sum(axis=1)
+
+
+def cover_prob(mu, sd, threshold, key_numbers=True, lo=-70, hi=70):
+    """(P(win | no push), P(push)) for the side that needs X > threshold."""
+    w, p, l = outcome_probs(mu, sd, threshold, key_numbers, lo, hi)
+    return float(w[0] / (w[0] + l[0])), float(p[0])
+
+
+# Exchange books show gross back prices. What you actually get is net of
+# commission, so treat the price as 1 + (price - 1) * (1 - commission).
+EXCHANGE_COMMISSION = {"betfair_ex_uk": 0.05, "betfair_ex_eu": 0.05, "betfair_ex_au": 0.05,
+                       "matchbook": 0.02, "smarkets": 0.02}
+
+
+def net_price(book_key, price):
+    c = EXCHANGE_COMMISSION.get(book_key, 0.0)
+    return 1 + (float(price) - 1) * (1 - c) if c else float(price)
+
+
+def book_label(bk):
+    c = EXCHANGE_COMMISSION.get(bk.get("key"), 0.0)
+    return f"{bk['title']} (net {c:.0%})" if c else bk["title"]
 
 
 def american_to_decimal(a):
@@ -299,8 +351,8 @@ def odds_to_rows(events):
                 for oc in mk.get("outcomes", []):
                     rows.append({
                         "event_id": ev["id"], "home": home, "away": away,
-                        "book": bk["title"], "market": mk["key"],
-                        "name": oc["name"], "price": oc["price"],
+                        "book": book_label(bk), "market": mk["key"],
+                        "name": oc["name"], "price": net_price(bk.get("key"), oc["price"]),
                         "point": oc.get("point"),
                     })
     return pd.DataFrame(rows)
@@ -389,11 +441,12 @@ def build_bets(preds, odds, params=None):
         raw_m, raw_t = r["raw_margin"], r["raw_total"]
         reason = (f"Model line {fmt_spread(h, a, raw_m)}, total {raw_t:.1f} · "
                   f"Market {fmt_spread(h, a, r['mkt_spread'])}, total {r['mkt_total']}")
+        pushes = {"Moneyline": 0.0, "Spread": 0.0, "Total": 0.0}
         cands = []  # (market, key, side, label, line, best, fair, raw_prob, w)
 
         fh = pr.get("fair_ml_home")
         if fh is not None:
-            raw_h = 1 - norm_cdf(-raw_m / p["margin_sd_raw"])
+            raw_h, _ = cover_prob(raw_m, p["margin_sd_raw"], 0)
             w = p["w_margin"]
             cands += [
                 ("Moneyline", "moneyline", "home", f"{h} to win", None, pr.get("ml_home"), fh, raw_h, w),
@@ -402,7 +455,7 @@ def build_bets(preds, odds, params=None):
         fs = pr.get("fair_spread_home")
         if fs is not None:
             line = pr["spread_line"]  # home team's handicap, e.g. -3.5
-            raw_c = 1 - norm_cdf((-line - raw_m) / p["margin_sd_raw"])
+            raw_c, pushes["Spread"] = cover_prob(raw_m, p["margin_sd_raw"], -line)
             w = p["w_margin"]
             cands += [
                 ("Spread", "spread", "home", f"{h} {line:+g}", line, pr.get("spread_home"), fs, raw_c, w),
@@ -411,7 +464,7 @@ def build_bets(preds, odds, params=None):
         fo = pr.get("fair_over")
         if fo is not None:
             line = pr["total_line"]
-            raw_o = 1 - norm_cdf((line - raw_t) / p["total_sd_raw"])
+            raw_o, pushes["Total"] = cover_prob(raw_t, p["total_sd_raw"], line, False, 0, 130)
             w = p["w_total"]
             cands += [
                 ("Total", "total", "over", f"Over {line:g}", line, pr.get("over"), fo, raw_o, w),
@@ -431,7 +484,9 @@ def build_bets(preds, odds, params=None):
                 "selection": label, "line": line, "player_id": "", "player": "",
                 "price": price, "book": book, "model": model, "fair": fair,
                 "raw_model": raw, "implied": 1 / price, "edge": edge,
-                "ev": model * price - 1, "reason": reason,
+                "push": pushes[market],
+                "ev": (1 - pushes[market]) * (model * price - 1),
+                "reason": reason,
                 "light": classify_pick(edge * 100, model * 100, market),
             })
     return pd.DataFrame(bets)
@@ -604,15 +659,22 @@ def simulate_bets(bt, fit, use_blend=True, thresholds=(0.0, 0.03, 0.05)):
                         "roi": profit / n if n else np.nan})
 
     # Spread: side A = home
-    p_home_cover = 1 - norm_cdf_arr((spread - mm) / msd)
+    ok = ~np.isnan(spread)
+    p_home_cover = np.full(len(spread), np.nan)
+    w_, _p, l_ = outcome_probs(mm[ok], msd, spread[ok])
+    p_home_cover[ok] = w_ / (w_ + l_)
     run("Spread", p_home_cover, dec("home_sp_odds"), dec("away_sp_odds"),
         result > spread, result == spread)
     # Total: side A = over
-    p_over = 1 - norm_cdf_arr((tline - mt) / tsd)
+    ok = ~np.isnan(tline) & ~np.isnan(mt)
+    p_over = np.full(len(tline), np.nan)
+    w_, _p, l_ = outcome_probs(mt[ok], tsd, tline[ok], False, 0, 130)
+    p_over[ok] = w_ / (w_ + l_)
     run("Total", p_over, dec("over_odds"), dec("under_odds"),
         total > tline, total == tline)
     # Moneyline: side A = home
-    p_home = 1 - norm_cdf_arr(-mm / msd)
+    w_, _p, l_ = outcome_probs(mm, msd, 0.0)
+    p_home = w_ / (w_ + l_)
     run("Moneyline", p_home, dec_ml(bt["home_ml"]), dec_ml(bt["away_ml"]),
         result > 0, result == 0)
     return pd.DataFrame(out)
