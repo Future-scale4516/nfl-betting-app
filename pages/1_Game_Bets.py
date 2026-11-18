@@ -22,6 +22,7 @@ if not ctx.is_current:
     st.stop()
 
 sel_games = ui.game_filter(ctx)
+ui.exposure_banner(ctx)
 
 
 def analyse(force=False):
@@ -42,6 +43,8 @@ def analyse(force=False):
     # Fetch + store only. The display lives in the persistent block below,
     # gated on session_state, so sort/filter widgets don't make the list vanish.
     st.session_state["game_edges"] = ui.attach_times(bets, ctx.week_games)
+    st.session_state["game_shop"] = ui.attach_times(nm.build_shop_bets(ctx.preds, odds),
+                                                    ctx.week_games)
     st.session_state["game_edges_week"] = ctx.week
     st.session_state["game_edges_remaining"] = remaining
 
@@ -99,8 +102,35 @@ if isinstance(gdf, pd.DataFrame) and not gdf.empty \
                     st.caption(f"{b['game']} · {b['Start']} ({b['US Date']})")
                     st.caption(f"Model %: {b['model']:.1%}")
 
-    ml_tab, sp_tab, tot_tab, likely_tab = st.tabs(
-        ["💰 Money Line", "📏 Spread", "📊 Totals", "🎯 Most Likely"])
+    def show_shop(tab):
+        with tab:
+            st.caption("Treats the bookmakers' consensus as the truth and finds the best price "
+                       "AND line across books for each selection. Line value is how much "
+                       "better the win chance is at the line you'd take (a half point across "
+                       "3 or 7 is worth the most). No model opinion is used here, because the "
+                       "backtest found the model does not beat the market. EV assumes the "
+                       "consensus is right, so confirm the live line at your book.")
+            shop = st.session_state.get("game_shop")
+            if not isinstance(shop, pd.DataFrame) or shop.empty:
+                st.write("Press Analyse to build the shopping view.")
+                return
+            shop = shop[shop["game_id"].isin(sel_games)]
+            if only_pos:
+                shop = shop[shop["ev"] > 0]
+            picks = st.multiselect("Markets to include:", ["Moneyline", "Spread", "Total"],
+                                   default=["Moneyline", "Spread", "Total"], key="shop_mk")
+            shop = shop[shop["market"].isin(picks)]
+            if shop.empty:
+                st.write("Nothing matches the current filters.")
+                return
+            shop = ui.sort_picker(shop, [("EV % (high to low)", "ev", False),
+                                         ("Start time", "_ct", True)], key="sort_shop")
+            for _, b in shop.iterrows():
+                ui.bet_card(ctx, b, "g_shop", shop=True)
+
+    shop_tab, ml_tab, sp_tab, tot_tab, likely_tab = st.tabs(
+        ["🛒 Shop", "💰 Money Line", "📏 Spread", "📊 Totals", "🎯 Most Likely"])
+    show_shop(shop_tab)
     show_market(ml_tab, "Moneyline", "g_ml")
     show_market(sp_tab, "Spread", "g_sp")
     show_market(tot_tab, "Total", "g_tot")

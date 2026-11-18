@@ -156,6 +156,19 @@ except Exception as e:
     st.stop()
 
 c1, c2, c3 = st.columns(3)
+if st.button("Update CLV from snapshots"):
+    try:
+        games, props_s = tk.load_snapshots("games", force=True), tk.load_snapshots("props", force=True)
+        if games.empty:
+            st.info("No snapshots in your Gist yet. Set up the snapshot job first (see the "
+                    "README note), then try again after a game has kicked off.")
+        else:
+            new, n = tk.update_clv_fair(picks, games, props_s)
+            tk.save_picks(new)
+            picks = new
+            st.success(f"Updated CLV vs the de-vigged close for {n} pick(s).")
+    except Exception as e:
+        st.error(f"Snapshot CLV failed: {e}")
 if c1.button("Reload"):
     try:
         picks = tk.load_picks(force=True)
@@ -213,15 +226,17 @@ def show(df):
     open_n = int((df["result"].isna() | (df["result"] == "")).sum())
     staked, profit = settled["stake"].sum(), settled["profit"].sum()
     clv = df["clv"].dropna()
+    clvf = df["clv_fair"].dropna()
     a, b, c, d = st.columns(4)
     a.metric("Picks", len(df))
     a.caption(f"{open_n} open")
     b.metric("Profit (£)", f"{profit:+.2f}")
     c.metric("ROI", f"{profit / staked:+.1%}" if staked else "n/a")
-    d.metric("Avg CLV", f"{clv.mean():+.1%}" if len(clv) else "n/a")
-    d.caption(f"{len(clv)} with closing price")
+    d.metric("Avg CLV vs fair close", f"{clvf.mean():+.1%}" if len(clvf) else "n/a")
+    d.caption(f"{len(clvf)} measured · vs best live price: "
+              f"{clv.mean():+.1%}" if len(clv) else f"{len(clvf)} measured")
     cols = ["logged_at", "week", "selection", "game", "book", "price", "close_price", "clv",
-            "model", "stake", "result", "profit"]
+            "clv_fair", "close_ref", "model", "stake", "result", "profit"]
     st.dataframe(df.sort_values("logged_at", ascending=False)[cols], hide_index=True)
     folds = df[df["market_key"] == tk.FOLD_KEY]
     if not folds.empty:

@@ -1,0 +1,26 @@
+name: Price snapshots
+on:
+  schedule:
+    - cron: "*/30 * * * *"      # base: every 30 minutes
+    - cron: "*/10 13-14 * * 0"  # Sunday London-game kickoffs
+    - cron: "*/10 17-18 * * 0"  # Sunday 1pm ET kickoffs
+    - cron: "*/10 20-21 * * 0"  # Sunday 4pm ET kickoffs
+    - cron: "*/10 0-1 * * 1"    # Sunday night game
+    - cron: "*/10 0-1 * * 5"    # Thursday night game
+    - cron: "*/10 0-1 * * 2"    # Monday night game
+  workflow_dispatch:
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - run: python snapshot.py
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}

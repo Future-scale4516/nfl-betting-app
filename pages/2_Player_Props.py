@@ -20,6 +20,7 @@ if not ctx.is_current:
     st.stop()
 
 sel_games = ui.game_filter(ctx)
+ui.exposure_banner(ctx)
 proj = ui.get_projection(ctx)
 active = proj[proj["inj"] != "OUT"]
 st.caption(f"{len(active)} players projected · {len(proj) - len(active)} ruled out "

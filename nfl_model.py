@@ -492,6 +492,111 @@ def build_bets(preds, odds, params=None):
     return pd.DataFrame(bets)
 
 
+def implied_mu(fair, threshold, sd, key_numbers=True, lo=-70, hi=70):
+    """The mean outcome that makes P(X > threshold | no push) equal `fair`, i.e. the
+    distribution the bookmakers' consensus price implies."""
+    a, b = threshold - 6 * sd, threshold + 6 * sd
+    for _ in range(40):
+        m = (a + b) / 2
+        if cover_prob(m, sd, threshold, key_numbers, lo, hi)[0] < fair:
+            a = m
+        else:
+            b = m
+    return (a + b) / 2
+
+
+def build_shop_bets(preds, odds, params=None):
+    """Price and line shopping. Takes the market's consensus as the truth (the
+    distribution implied by its de-vigged price at the consensus line), then looks
+    for the best EV across every bookmaker's price AND line. No model opinion: the
+    backtest found none that beats the closing line. For each selection returns the
+    single best book/line. Same columns as build_bets, so the same cards work."""
+    p = params or PARAMS
+    out = []
+    for _, r in preds.iterrows():
+        h, a = r["home"], r["away"]
+        pr = best_prices(odds, h, a)
+        if not pr:
+            continue
+        g = odds[(odds["home"] == h) & (odds["away"] == a)]
+        hn, an = ABBR_TEAM[h], ABBR_TEAM[a]
+        base = {"game_id": r["game_id"], "home": h, "away": a, "game": f"{a} @ {h}",
+                "gameday": r["gameday"], "gametime": r["gametime"], "player_id": "",
+                "player": ""}
+
+        def emit(market, key, side, label, line, price, book, prob, fair, push, note):
+            out.append({**base, "market": market, "market_key": key, "side": side,
+                        "selection": label, "line": line, "price": float(price),
+                        "book": book, "model": prob, "fair": fair, "raw_model": prob,
+                        "implied": 1 / float(price), "edge": prob - fair, "push": push,
+                        "ev": (1 - push) * (prob * float(price) - 1), "reason": note,
+                        "light": classify_pick((prob - fair) * 100, prob * 100, market)})
+
+        def best_of(cands):  # cands: list of (ev, args)
+            return max(cands, key=lambda c: c[0])[1] if cands else None
+
+        fh = pr.get("fair_ml_home")
+        if fh is not None:
+            for side, name, fair, lab in (("home", hn, fh, f"{h} to win"),
+                                          ("away", an, 1 - fh, f"{a} to win")):
+                rows = g[(g["market"] == "h2h") & (g["name"] == name)]
+                if rows.empty:
+                    continue
+                b = rows.loc[rows["price"].idxmax()]
+                emit("Moneyline", "moneyline", side, lab, None, b["price"], b["book"],
+                     fair, fair, 0.0, "Best moneyline price across books")
+
+        fs, L = pr.get("fair_spread_home"), pr.get("spread_line")
+        if fs is not None:
+            mu = implied_mu(fs, -L, p["margin_sd_raw"])
+            sp = g[g["market"] == "spreads"]
+            for side, name, lab_team in (("home", hn, h), ("away", an, a)):
+                cands = []
+                for _, b in sp[sp["name"] == name].iterrows():
+                    pt = float(b["point"])
+                    if side == "home":
+                        win, push = cover_prob(mu, p["margin_sd_raw"], -pt)
+                        line = pt
+                    else:
+                        w_, p_, l_ = outcome_probs([mu], p["margin_sd_raw"], pt)
+                        win, push, line = float(l_[0] / (w_[0] + l_[0])), float(p_[0]), -pt
+                    ev = (1 - push) * (win * b["price"] - 1)
+                    cands.append((ev, (side, f"{lab_team} {pt:+g}", line, b["price"], b["book"],
+                                       win, push, pt)))
+                best = best_of(cands)
+                if best:
+                    side_, lab, line, price, book, win, push, pt = best
+                    cons = L if side == "home" else -L
+                    fair = fs if side == "home" else 1 - fs
+                    note = (f"Consensus {lab_team} {cons:+g}" +
+                            (f" · taking {pt:+g} (line value)" if abs(pt - cons) > 1e-9 else ""))
+                    emit("Spread", "spread", side_, lab, line, price, book, win, fair, push, note)
+
+        fo, T = pr.get("fair_over"), pr.get("total_line")
+        if fo is not None:
+            mu = implied_mu(fo, T, p["total_sd_raw"], False, 0, 130)
+            tot = g[g["market"] == "totals"]
+            for side, name in (("over", "Over"), ("under", "Under")):
+                cands = []
+                for _, b in tot[tot["name"] == name].iterrows():
+                    pt = float(b["point"])
+                    w_, p_, l_ = outcome_probs([mu], p["total_sd_raw"], pt, False, 0, 130)
+                    win = float(w_[0] / (w_[0] + l_[0])) if side == "over" \
+                        else float(l_[0] / (w_[0] + l_[0]))
+                    push = float(p_[0])
+                    ev = (1 - push) * (win * b["price"] - 1)
+                    cands.append((ev, (side, f"{name} {pt:g}", pt, b["price"], b["book"],
+                                       win, push, pt)))
+                best = best_of(cands)
+                if best:
+                    side_, lab, line, price, book, win, push, pt = best
+                    fair = fo if side == "over" else 1 - fo
+                    note = f"Consensus total {T:g}" + \
+                        (f" · taking {pt:g} (line value)" if abs(pt - T) > 1e-9 else "")
+                    emit("Total", "total", side_, lab, line, price, book, win, fair, push, note)
+    return pd.DataFrame(out)
+
+
 # ---------- Backtest ----------
 def run_backtest(tw_all, sched_all, seasons, k=None, regress=None):
     """Replay past seasons week by week using only information available

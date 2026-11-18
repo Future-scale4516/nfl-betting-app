@@ -30,6 +30,46 @@ METRIC_NOTE = ("Model %: our probability (starts from the market) · Fair %: boo
 # start: unlike the MLB app there is no tracked NFL history yet. Update these
 # from the Results page as real results and CLV come in.
 TRUST_TIER = {"Anytime TD": 0.5}
+KELLY_FRAC = 0.25   # fraction of full Kelly
+KELLY_CAP = 0.01    # max share of bankroll on one bet
+WEEK_CAP = 0.05     # max share of bankroll open per week
+
+
+def kelly_share(prob, price, frac=KELLY_FRAC, cap=KELLY_CAP):
+    """Fraction of bankroll to stake: frac * (p*d - 1)/(d - 1), clipped to [0, cap]."""
+    if not price or price <= 1 or prob is None or pd.isna(prob):
+        return 0.0
+    full = (prob * price - 1) / (price - 1)
+    return float(min(max(frac * full, 0.0), cap))
+
+
+def stake_for(ctx, b):
+    """(stake in £, short note). Flat mode is the sidebar stake; Kelly mode sizes by
+    the pick's probability and price, and falls back to flat when EV <= 0."""
+    if ctx.stake_mode != "Fractional Kelly":
+        return ctx.stake, f"flat £{ctx.stake:.2f}"
+    share = kelly_share(b["model"], b["price"])
+    if share <= 0:
+        return ctx.stake, f"no positive EV, flat £{ctx.stake:.2f}"
+    s = max(round(ctx.bankroll * share * 2) / 2, 0.5)  # nearest 50p, never below 50p
+    return s, f"¼ Kelly, {share:.2%} of bankroll"
+
+
+def exposure_banner(ctx):
+    """Open stake for the selected week against the weekly cap."""
+    cap = ctx.bankroll * WEEK_CAP
+    try:
+        picks = tk.load_picks()
+        wk = picks[(picks["week"] == ctx.week) & (picks["season"] == SEASON)
+                   & (picks["result"].isna() | (picks["result"] == ""))]
+        open_stake = float(wk["stake"].sum())
+    except Exception:
+        return
+    msg = f"Open stake this week: £{open_stake:.2f} of £{cap:.2f} cap ({WEEK_CAP:.0%} of bankroll)"
+    if open_stake > cap:
+        st.warning(msg + ". Over the cap: hold off on more bets this week.")
+    else:
+        st.caption(msg)
 
 
 # ---------- Page setup ----------
@@ -51,8 +91,15 @@ def get_context():
     current_week = int(unplayed["week"].min()) if len(unplayed) else int(reg["week"].max())
     weeks = sorted(int(w) for w in reg["week"].unique())
     week = st.sidebar.selectbox("Week", weeks, index=weeks.index(current_week), key="week")
-    stake = st.sidebar.number_input("Stake for logged picks (£)", 0.5, 1000.0, 1.0, 0.5,
+    stake = st.sidebar.number_input("Flat stake for logged picks (£)", 0.5, 1000.0, 1.0, 0.5,
                                     key="stake")
+    bankroll = st.sidebar.number_input("Bankroll (£)", 10.0, 1_000_000.0, 100.0, 10.0,
+                                       key="bankroll")
+    stake_mode = st.sidebar.selectbox("Staking", ["Flat stake", "Fractional Kelly"],
+                                      key="stake_mode",
+                                      help=f"Fractional Kelly stakes {KELLY_FRAC:.0%} of full "
+                                           f"Kelly, capped at {KELLY_CAP:.0%} of bankroll per "
+                                           "bet, and only where EV is positive.")
     week_games = reg[reg["week"] == week]
     is_current = week == current_week
 
@@ -67,6 +114,7 @@ def get_context():
     preds = nm.predict_games(week_games, ratings, lg_total, qb_out=qb_out)
     return SimpleNamespace(
         week=week, current_week=current_week, is_current=is_current, stake=stake,
+        bankroll=bankroll, stake_mode=stake_mode,
         week_games=week_games, ratings=ratings, lg_total=lg_total, logs=logs, inj=inj,
         inj_map=inj_map, qb_out=qb_out, preds=preds, teams=teams)
 
@@ -147,18 +195,26 @@ GAME_SORTS = [("Start time", "_ct", True), ("EV % (high to low)", "ev", False),
               ("Model % (high to low)", "model", False), ("Odds (high to low)", "price", False)]
 
 
-def bet_card(ctx, b, prefix, loggable=True):
+def bet_card(ctx, b, prefix, loggable=True, shop=False):
     """One pick as a compact card, with a Log pick button."""
     with st.container(border=True):
         st.markdown(f"{b['light']} **{b['selection']} @ {b['price']:.2f}**")
         st.caption(f"{b['game']} · {b['Start']} ({b['US Date']})")
-        st.caption(f"Model %: {b['model']:.1%} · Fair %: {b['fair']:.1%} · "
-                   f"Edge: {b['edge'] * 100:+.1f} pts · EV %: {b['ev']:+.1%}")
+        if shop:
+            st.caption(f"Win chance at this line: {b['model']:.1%} · Consensus fair: "
+                       f"{b['fair']:.1%} · Line value: {b['edge'] * 100:+.1f} pts · "
+                       f"EV %: {b['ev']:+.1%}")
+        else:
+            st.caption(f"Model %: {b['model']:.1%} · Fair %: {b['fair']:.1%} · "
+                       f"Edge: {b['edge'] * 100:+.1f} pts · EV %: {b['ev']:+.1%}")
         extra = f" · ⚠️ {b['inj_note']}" if b.get("inj_note") else ""
         st.caption(f"{b['reason']} · Best price: {b['book']}{extra}")
-        if loggable and st.button("Log pick", key=f"{prefix}_log_{tk.pick_id(b)}"):
+        stake, note = stake_for(ctx, b) if loggable else (ctx.stake, "")
+        if loggable:
+            st.caption(f"Suggested stake: £{stake:.2f} ({note})")
+        if loggable and st.button(f"Log pick (£{stake:.2f})", key=f"{prefix}_log_{tk.pick_id(b)}"):
             try:
-                ok = tk.log_pick(b.to_dict(), ctx.stake, SEASON, ctx.week)
+                ok = tk.log_pick(b.to_dict(), stake, SEASON, ctx.week)
                 st.toast("Pick logged" if ok else "Already logged")
             except Exception as e:
                 st.error(f"Could not save pick: {e}")

@@ -42,13 +42,20 @@ BIAS = {
     "pass_yards": 0.95, "pass_tds": 0.97, "rush_rec_yards": 0.99,
 }
 
-# Logistic recalibration of P(over) for the four volume markets (a * logit(p) + b).
-# Fitted on 2024-2025 standard lines; on the unseen 2026 weeks it cut log-loss
-# 0.4826 -> 0.4783 and fixed most of the under-confidence on likely overs. Fitted
-# on 2024 alone it also improved 2025. Not applied to passing yards (it hurt) or
-# passing TDs (no effect). A gap remains above 70% (model ~78% vs actual ~84%).
-CALIBRATION = {k: (1.11, 0.26) for k in
-               ("receptions", "rec_yards", "rush_yards", "rush_rec_yards")}
+# Per-market logistic recalibration of P(over): a * logit(p) + b. Fitted on as-of
+# projections (no look-ahead) for 2024 to 2026 wk10 at standard lines. Walk-forward
+# checks (fit on 2024-25, score unseen 2026 weeks) cut log-loss in every market
+# below; passing yards gains most (0.5609 -> 0.5543 on weeks 7-10) and, unlike the
+# earlier shared fit, is slightly flattened (a < 1: the raw model was over-confident
+# there on 2024-25). Passing TDs and an adaptive level correction were tested and
+# gave no reliable gain. Refit around week 14 and again after the season.
+CALIBRATION = {
+    "receptions": (1.15, 0.19),
+    "rec_yards": (1.09, 0.30),
+    "rush_yards": (1.16, 0.33),
+    "pass_yards": (0.84, 0.10),
+    "rush_rec_yards": (1.15, 0.27),
+}
 
 # Model probability is pulled this far toward the bookmaker's price before an
 # edge is shown (1 = trust the model fully). Tune from Results/CLV data.
@@ -131,22 +138,50 @@ def _project(vals, imp, prior, n_hist, half_life, m_vec):
     return mu, env, n
 
 
+def asof_priors(logs, min_rows=150):
+    """Position averages for every player-game using ONLY games played in
+    earlier weeks (no look-ahead). Returns an array aligned to logs.index.
+    Until a position has min_rows earlier qualifying player-games (the first
+    weeks of the first season), it falls back to the full-sample average."""
+    t = (logs["season"] * 100 + logs["week"]).to_numpy()
+    q = ((logs["touches"] >= 3) | (logs["attempts"] >= 10)).to_numpy()
+    full = position_priors(logs)
+    out = np.zeros((len(logs), len(PROJ_STATS)))
+    times = np.sort(np.unique(t))
+    for pos in logs["position"].unique():
+        in_pos = (logs["position"] == pos).to_numpy()
+        sel = in_pos & q
+        sums = pd.DataFrame(logs.loc[sel, PROJ_STATS].to_numpy(float),
+                            index=t[sel]).groupby(level=0).sum().reindex(times, fill_value=0.0)
+        cnt = pd.Series(1, index=t[sel]).groupby(level=0).sum().reindex(times, fill_value=0)
+        csum = sums.cumsum().shift(1).fillna(0.0)
+        ccnt = cnt.cumsum().shift(1).fillna(0)
+        mean = csum.div(ccnt.replace(0, np.nan), axis=0)
+        mean[ccnt < min_rows] = full.loc[pos].to_numpy(float)
+        rows = np.where(in_pos)[0]
+        out[rows] = mean.loc[t[rows]].to_numpy(float)
+    return out
+
+
 def rolling_table(logs, params=None, priors=None):
-    """For every player-game, project it using only earlier games."""
+    """For every player-game, project it using only earlier games. Position
+    priors are also as-of (earlier games only) unless `priors` is given."""
     p = params or PP
     logs = logs.reset_index(drop=True)
-    priors = position_priors(logs) if priors is None else priors
+    prior_rows = asof_priors(logs) if priors is None else None
+    pos_idx = ({pos: priors.loc[pos].to_numpy(float) for pos in priors.index}
+               if priors is not None else None)
     m_vec = _m_vec(p)
     out_mu = np.full((len(logs), len(PROJ_STATS)), np.nan)
     out_env = np.full(len(logs), np.nan)
     out_n = np.zeros(len(logs), dtype=int)
-    pos_idx = {pos: priors.loc[pos].to_numpy(float) for pos in priors.index}
     for _, g in logs.groupby("player_id", sort=False):
         vals = g[PROJ_STATS].to_numpy(float)
         imp = g["implied"].to_numpy(float)
-        prior = pos_idx[g["position"].iloc[-1]]
         idx = g.index.to_numpy()
         for i in range(1, len(g)):
+            prior = prior_rows[idx[i]] if prior_rows is not None \
+                else pos_idx[g["position"].iloc[-1]]
             mu, env, n = _project(vals[:i], imp[:i], prior, p["n_hist"],
                                   p["half_life"], m_vec)
             out_mu[idx[i]], out_env[idx[i]], out_n[idx[i]] = mu, env, n

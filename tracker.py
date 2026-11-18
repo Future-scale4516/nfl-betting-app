@@ -21,7 +21,7 @@ COLUMNS = [
     "pick_id", "logged_at", "season", "week", "game_id", "game", "gameday", "gametime",
     "market", "market_key", "side", "line", "player_id", "player", "selection", "book",
     "price", "model", "implied", "stake", "close_price", "clv", "result", "profit",
-    "settled_at", "legs",
+    "settled_at", "legs", "close_fair", "clv_fair", "close_ref",
 ]
 GIST_FILE = "picks.csv"
 
@@ -44,7 +44,8 @@ def _clean(df):
         if c not in df.columns:
             df[c] = np.nan
     df = df[COLUMNS].copy()
-    for c in ("player_id", "player", "result", "settled_at", "pick_id", "side", "legs"):
+    for c in ("player_id", "player", "result", "settled_at", "pick_id", "side", "legs",
+              "close_ref"):
         df[c] = df[c].astype("object")
     return df
 
@@ -61,7 +62,7 @@ def load_picks(force=False):
         if f and f.get("content", "").strip():
             df = pd.read_csv(io.StringIO(f["content"]), dtype=str)
             for c in ("season", "week", "line", "price", "model", "implied", "stake",
-                      "close_price", "clv", "profit"):
+                      "close_price", "clv", "profit", "close_fair", "clv_fair"):
                 if c in df.columns:
                     df[c] = pd.to_numeric(df[c], errors="coerce")
     st.session_state["picks"] = _clean(df)
@@ -315,7 +316,142 @@ def summarise(df, by="market"):
     g = s.groupby(by).agg(bets=("result", "size"),
                           wins=("result", lambda x: (x == "WIN").sum()),
                           staked=("staked", "sum"), profit=("profit", "sum"),
-                          avg_model=("model", "mean"), avg_clv=("clv", "mean"))
+                          avg_model=("model", "mean"), avg_clv=("clv", "mean"),
+                          avg_clv_fair=("clv_fair", "mean"))
     g["win_rate"] = g["wins"] / g["bets"]
     g["roi"] = g["profit"] / g["staked"]
-    return g[["bets", "wins", "win_rate", "staked", "profit", "roi", "avg_model", "avg_clv"]]
+    return g[["bets", "wins", "win_rate", "staked", "profit", "roi", "avg_model", "avg_clv",
+              "avg_clv_fair"]]
+
+
+# ---------- CLV against the de-vigged close (from snapshot.py) ----------
+def load_snapshots(prefix, force=False):
+    """All snap_<prefix>_*.csv files from the Gist as one DataFrame (empty if none)."""
+    key = f"snap_{prefix}"
+    if not force and key in st.session_state:
+        return st.session_state[key]
+    frames = []
+    if gist_ready():
+        r = requests.get(f"https://api.github.com/gists/{st.secrets['GIST_ID']}",
+                         headers=_headers(), timeout=30)
+        r.raise_for_status()
+        for name, f in r.json()["files"].items():
+            if name.startswith(f"snap_{prefix}_") and name.endswith(".csv"):
+                text = f.get("content", "")
+                if f.get("truncated"):
+                    text = requests.get(f["raw_url"], headers=_headers(), timeout=30).text
+                if text.strip():
+                    frames.append(pd.read_csv(io.StringIO(text)))
+    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    st.session_state[key] = df
+    return df
+
+
+def _close_rows(snaps, home_abbr, away_abbr, gameday):
+    """Snapshot rows for one game: the latest ones before kickoff (the close)."""
+    if snaps is None or snaps.empty:
+        return None
+    hn, an = nm.ABBR_TEAM.get(home_abbr), nm.ABBR_TEAM.get(away_abbr)
+    s = snaps[(snaps["home"] == hn) & (snaps["away"] == an)].copy()
+    if s.empty:
+        return None
+    ko = pd.to_datetime(s["commence_utc"], utc=True)
+    day = pd.to_datetime(gameday, errors="coerce")
+    if pd.notna(day):
+        s = s[(ko.dt.tz_localize(None).dt.normalize() - day).abs() <= pd.Timedelta(days=1)]
+    s = s[s["mins_to_ko"] <= 130]  # only a snapshot taken within ~2h of kickoff is a close
+    if s.empty:
+        return None
+    return s[s["ts_utc"] == s["ts_utc"].max()]
+
+
+def _pick_fair(rows, market, name, point=None):
+    r = rows[(rows["market"] == market) & (rows["name"] == name)]
+    if point is not None:
+        r = r[(r["point"].astype(float) - point).abs() < 1e-9]
+    return r
+
+
+def _row_fair(r):
+    """(fair prob, label) for a snapshot row: Pinnacle if it lists the pair, else the
+    median across books."""
+    if pd.notna(r.get("fair_pinn")) and r.get("fair_pinn") != "":
+        return float(r["fair_pinn"]), "Pinnacle"
+    if pd.notna(r.get("fair_median")) and r.get("fair_median") != "":
+        return float(r["fair_median"]), "Market median"
+    return None, None
+
+
+def closing_fair(pick, games, props):
+    """(fair probability at the close for this pick's selection, label) or (None, None).
+    Spread and total picks whose line has moved are converted to the pick's own line
+    with the same key-number-aware distribution the app prices with."""
+    h, a = [x.strip() for x in str(pick["game"]).split("@")][::-1]
+    key, side, line = pick["market_key"], pick["side"], pick["line"]
+    params = nm.PARAMS
+    if key in ("moneyline", "spread", "total"):
+        rows = _close_rows(games, h, a, pick["gameday"])
+        if rows is None:
+            return None, None
+        if key == "moneyline":
+            r = _pick_fair(rows, "h2h", nm.ABBR_TEAM[h if side == "home" else a])
+            return _row_fair(r.iloc[0]) if len(r) else (None, None)
+        if key == "spread":
+            r = rows[(rows["market"] == "spreads") & (rows["name"] == nm.ABBR_TEAM[h])]
+            if r.empty:
+                return None, None
+            r = r.sort_values("n_books", ascending=False).iloc[0]
+            f, lab = _row_fair(r)
+            if f is None:
+                return None, None
+            mu = nm.implied_mu(f, -float(r["point"]), params["margin_sd_raw"])
+            cond_home = nm.cover_prob(mu, params["margin_sd_raw"], -float(line))[0]
+            return (cond_home if side == "home" else 1 - cond_home), lab
+        r = rows[(rows["market"] == "totals") & (rows["name"] == "Over")]
+        if r.empty:
+            return None, None
+        r = r.sort_values("n_books", ascending=False).iloc[0]
+        f, lab = _row_fair(r)
+        if f is None:
+            return None, None
+        mu = nm.implied_mu(f, float(r["point"]), params["total_sd_raw"], False, 0, 130)
+        over = nm.cover_prob(mu, params["total_sd_raw"], float(line), False, 0, 130)[0]
+        return (over if side == "over" else 1 - over), lab
+
+    # player props: same line only (a moved prop line is not comparable)
+    if props is None or props.empty or key not in pr.MARKETS:
+        return None, None
+    rows = _close_rows(props, h, a, pick["gameday"])
+    if rows is None:
+        return None, None
+    name = {"yes": "Yes", "over": "Over", "under": "Under"}[side]
+    r = rows[(rows["market"] == pr.MARKETS[key][1]) & (rows["name"] == name)
+             & (rows["player"].map(pr.norm_name) == pr.norm_name(pick["player"]))]
+    if key != "anytime_td":
+        r = r[(r["point"].astype(float) - float(line)).abs() < 1e-9]
+    if r.empty:
+        return None, None
+    r = r.iloc[0]
+    if pd.notna(r["fair_median"]) and r["fair_median"] != "":
+        return float(r["fair_median"]), "Market median"
+    return 1 / float(r["median_price"]), "Implied (incl. margin)"
+
+
+def update_clv_fair(df, games, props):
+    """CLV vs the de-vigged close: price * close_fair - 1. Positive = you got a better
+    price than the market's own fair price at kickoff. Returns (df, n updated)."""
+    df = df.copy()
+    df["close_ref"] = df["close_ref"].astype("object")
+    for c in ("close_fair", "clv_fair"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    n = 0
+    for i in df.index:
+        if df.at[i, "market_key"] == FOLD_KEY:
+            continue
+        f, lab = closing_fair(df.loc[i], games, props)
+        if f:
+            df.at[i, "close_fair"] = f
+            df.at[i, "clv_fair"] = df.at[i, "price"] * f - 1
+            df.at[i, "close_ref"] = lab
+            n += 1
+    return df, n
